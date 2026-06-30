@@ -21,6 +21,9 @@ Important model:
   * Strict length is default; pass --allow-growth only when intentionally testing
     relocated/grown logical messages.
   * No auto-padding and no auto-wrap are performed.
+  * Default text codec is cp932/Windows-31J because the engine uses CP932/EUDC glyph slots.
+    Private-use characters such as U+E000/U+E001 are valid JSON text and round-trip
+    back to their CP932 bytes when the editor preserves UTF-8.
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ DEFAULT_INPLACE_VADDR_BASE = 0x002AF000
 DEFAULT_INPLACE_MAX_SIZE = 3734108
 META_FILENAME = "scenario_meta.json"
 TEXT_OPCODE = b"\x02\x0B\x00\x0A"
-DEFAULT_ENCODING = "shift_jis"
+DEFAULT_ENCODING = "cp932"
 
 
 @dataclass

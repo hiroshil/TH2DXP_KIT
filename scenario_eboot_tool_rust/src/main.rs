@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use encoding_rs::Encoding;
+use encoding_rs::SHIFT_JIS;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use serde::{Deserialize, Serialize};
@@ -9,14 +9,20 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
+use std::sync::OnceLock;
 use std::path::{Path, PathBuf};
 
 const TOOL_NAME: &str = "scenario_eboot_structured_rust_cli";
 const TOOL_VERSION: u32 = 1;
+const DEFAULT_TABLE_START: usize = 0x000E_E8B4;
+const DEFAULT_MAX_ENTRIES: usize = 2000;
+const DEFAULT_INPLACE_OFFSET_BASE: usize = 0x0029_F000;
+const DEFAULT_INPLACE_VADDR_BASE: usize = 0x002A_F000;
+const DEFAULT_INPLACE_MAX_SIZE: usize = 3_734_108;
+const RUST_WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
 const META_FILENAME: &str = "scenario_meta.json";
 const TEXT_OPCODE: [u8; 4] = [0x02, 0x0B, 0x00, 0x0A];
-// lzma-sdk-rs can use more stack than Windows gives the main thread by default.
-const RUST_WORKER_STACK_SIZE: usize = 64 * 1024 * 1024;
+const DEFAULT_ENCODING: &str = "cp932";
 
 #[derive(Debug, Clone)]
 struct ProgramHeader {
@@ -142,11 +148,11 @@ enum Commands {
         use_hash: bool,
         #[arg(long = "font-tbl")]
         font_tbl: Option<PathBuf>,
-        #[arg(long = "table-start", value_parser = parse_usize_arg, default_value = "0x000E_E8B4")]
+        #[arg(long = "table-start", value_parser = parse_usize_arg, default_value_t = DEFAULT_TABLE_START)]
         table_start: usize,
-        #[arg(long = "max-entries", default_value_t = 2000)]
+        #[arg(long = "max-entries", default_value_t = DEFAULT_MAX_ENTRIES)]
         max_entries: usize,
-        #[arg(long, default_value = "shift_jis")]
+        #[arg(long, default_value = DEFAULT_ENCODING)]
         encoding: String,
         #[arg(long = "debug-offsets")]
         debug_offsets: bool,
@@ -167,15 +173,15 @@ enum Commands {
         no_verify_relocations: bool,
         #[arg(long = "font-tbl")]
         font_tbl: Option<PathBuf>,
-        #[arg(long = "table-start", value_parser = parse_usize_arg, default_value = "0x000E_E8B4")]
+        #[arg(long = "table-start", value_parser = parse_usize_arg, default_value_t = DEFAULT_TABLE_START)]
         table_start: usize,
-        #[arg(long = "inplace-offset-base", value_parser = parse_usize_arg, default_value = "0x0029_F000")]
+        #[arg(long = "inplace-offset-base", value_parser = parse_usize_arg, default_value_t = DEFAULT_INPLACE_OFFSET_BASE)]
         inplace_offset_base: usize,
-        #[arg(long = "inplace-vaddr-base", value_parser = parse_usize_arg, default_value = "0x002A_F000")]
+        #[arg(long = "inplace-vaddr-base", value_parser = parse_usize_arg, default_value_t = DEFAULT_INPLACE_VADDR_BASE)]
         inplace_vaddr_base: usize,
-        #[arg(long = "inplace-max-size", value_parser = parse_usize_arg, default_value = "3734108")]
+        #[arg(long = "inplace-max-size", value_parser = parse_usize_arg, default_value_t = DEFAULT_INPLACE_MAX_SIZE)]
         inplace_max_size: usize,
-        #[arg(long, default_value = "shift_jis")]
+        #[arg(long, default_value = DEFAULT_ENCODING)]
         encoding: String,
         #[arg(short = 'j', long = "thread", alias = "threads")]
         thread: Option<usize>,
@@ -195,9 +201,17 @@ fn parse_usize_value(value: &str) -> Result<usize> {
     parse_usize_arg(value).map_err(|e| anyhow::anyhow!(e))
 }
 
-fn encoding_from_label(label: &str) -> Result<&'static Encoding> {
-    Encoding::for_label(label.as_bytes())
-        .with_context(|| format!("unsupported encoding label: {label}"))
+#[derive(Debug, Clone, Copy)]
+struct TextEncoding;
+
+fn encoding_from_label(label: &str) -> Result<TextEncoding> {
+    let normalized = label.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "cp932" | "ms932" | "windows-31j" | "windows31j" | "shift-jis" | "shiftjis" | "sjis" => Ok(TextEncoding),
+        _ => bail!(
+            "unsupported encoding label: {label}. Supported labels: cp932, ms932, windows-31j, shift_jis, sjis"
+        ),
+    }
 }
 
 fn validate_threads(thread: Option<usize>) -> Result<Option<usize>> {
@@ -466,7 +480,7 @@ impl FontTable {
         })
     }
 
-    fn decode_bytes(&self, data: &[u8], encoding: &'static Encoding) -> String {
+    fn decode_bytes(&self, data: &[u8], encoding: TextEncoding) -> String {
         let mut out = String::new();
         let mut i = 0usize;
         while i < data.len() {
@@ -502,7 +516,7 @@ impl FontTable {
         out
     }
 
-    fn encode_text(&self, text: &str, encoding: &'static Encoding) -> Vec<u8> {
+    fn encode_text(&self, text: &str, encoding: TextEncoding) -> Vec<u8> {
         let mut out = Vec::new();
         let mut i = 0usize;
         while i < text.len() {
@@ -549,86 +563,96 @@ fn load_font_table_arg(path_arg: Option<&Path>) -> Result<Option<FontTable>> {
     }
 }
 
-fn is_shift_jis_encoding(encoding: &'static Encoding) -> bool {
-    encoding.name().eq_ignore_ascii_case("Shift_JIS")
+fn decode_strict(data: &[u8], _encoding: TextEncoding) -> Result<String> {
+    decode_cp932_strict(data)
 }
 
-fn validate_python_shift_jis(data: &[u8]) -> Result<()> {
-    // Python's `shift_jis` codec is stricter than encoding_rs/WHATWG Shift_JIS.
-    // In particular, byte pairs with lead bytes F0-FC are Windows/CP932 EUDC
-    // extensions.  Python rejects them in strict mode, so extraction must skip
-    // such TEXT records and leave them inside opcode_gap just like the original
-    // Python tool.
+fn decode_cp932_strict(data: &[u8]) -> Result<String> {
+    // The game engine uses Windows CP932 / Windows-31J semantics, not strict
+    // JIS Shift-JIS.  Keep ASCII 0x5C as backslash for engine controls, keep
+    // JIS X 0201 half-width kana, accept CP932 vendor/EUDC double-byte ranges
+    // F0..FC, and preserve CP932 single-byte PUA slots 80/A0/FD/FE/FF.
+    let mut out = String::new();
     let mut i = 0usize;
     while i < data.len() {
         let b = data[i];
-        if b <= 0x7f || (0xa1..=0xdf).contains(&b) {
+
+        if b <= 0x7F {
+            out.push(char::from(b));
             i += 1;
             continue;
         }
-        if (0x81..=0x9f).contains(&b) || (0xe0..=0xef).contains(&b) {
-            if i + 1 >= data.len() {
-                bail!("decode error");
-            }
-            let t = data[i + 1];
-            if (0x40..=0x7e).contains(&t) || (0x80..=0xfc).contains(&t) {
-                i += 2;
-                continue;
-            }
-            bail!("decode error");
+
+        if let Some(ch) = cp932_single_byte_char(b) {
+            out.push(ch);
+            i += 1;
+            continue;
         }
-        bail!("decode error");
+
+        if is_cp932_lead_byte(b) {
+            if i + 1 >= data.len() {
+                bail!("incomplete cp932 lead byte 0x{b:02X} at byte {i}");
+            }
+            let trail = data[i + 1];
+            if !is_cp932_trail_byte(trail) {
+                bail!("invalid cp932 trail byte 0x{trail:02X} after lead 0x{b:02X} at byte {i}");
+            }
+            let pair = [b, trail];
+            let (cow, had_errors) = SHIFT_JIS.decode_without_bom_handling(&pair);
+            if had_errors {
+                bail!("invalid cp932 byte pair {:02X}{:02X} at byte {i}", b, trail);
+            }
+            out.push_str(&cow);
+            i += 2;
+            continue;
+        }
+
+        bail!("invalid cp932 byte 0x{b:02X} at byte {i}");
     }
-    Ok(())
+    Ok(out)
 }
 
-fn python_shift_jis_decode_fixups(text: String) -> String {
-    text.chars()
-        .map(|ch| match ch {
-            '\u{ff5e}' => '\u{301c}', // 8160: fullwidth tilde -> wave dash
-            '\u{2225}' => '\u{2016}', // 8161
-            '\u{ff0d}' => '\u{2212}', // 817c
-            '\u{ffe0}' => '\u{00a2}', // 8191
-            '\u{ffe1}' => '\u{00a3}', // 8192
-            '\u{ffe2}' => '\u{00ac}', // 81ca
-            _ => ch,
-        })
-        .collect()
+fn cp932_single_byte_char(b: u8) -> Option<char> {
+    match b {
+        0x80 => Some('\u{0080}'),
+        0xA0 => Some('\u{F8F0}'),
+        0xA1..=0xDF => char::from_u32(0xFF61 + u32::from(b - 0xA1)),
+        0xFD => Some('\u{F8F1}'),
+        0xFE => Some('\u{F8F2}'),
+        0xFF => Some('\u{F8F3}'),
+        _ => None,
+    }
 }
 
-fn python_shift_jis_encode_fixup(ch: char) -> char {
+fn cp932_byte_from_single_char(ch: char) -> Option<u8> {
     match ch {
-        '\u{301c}' => '\u{ff5e}',
-        '\u{2016}' => '\u{2225}',
-        '\u{2212}' => '\u{ff0d}',
-        '\u{00a2}' => '\u{ffe0}',
-        '\u{00a3}' => '\u{ffe1}',
-        '\u{00ac}' => '\u{ffe2}',
-        _ => ch,
+        '\u{0080}' => Some(0x80),
+        '\u{F8F0}' => Some(0xA0),
+        '\u{F8F1}' => Some(0xFD),
+        '\u{F8F2}' => Some(0xFE),
+        '\u{F8F3}' => Some(0xFF),
+        _ => {
+            let cp = ch as u32;
+            if (0xFF61..=0xFF9F).contains(&cp) {
+                Some(0xA1 + (cp - 0xFF61) as u8)
+            } else {
+                None
+            }
+        }
     }
 }
 
-fn decode_strict(data: &[u8], encoding: &'static Encoding) -> Result<String> {
-    let python_shift_jis = is_shift_jis_encoding(encoding);
-    if python_shift_jis {
-        validate_python_shift_jis(data)?;
-    }
+fn is_cp932_lead_byte(b: u8) -> bool {
+    (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b)
+}
 
-    let (cow, had_errors) = encoding.decode_without_bom_handling(data);
-    if had_errors {
-        bail!("decode error");
-    }
-    let decoded = cow.into_owned();
-    if python_shift_jis {
-        Ok(python_shift_jis_decode_fixups(decoded))
-    } else {
-        Ok(decoded)
-    }
+fn is_cp932_trail_byte(b: u8) -> bool {
+    (0x40..=0x7E).contains(&b) || (0x80..=0xFC).contains(&b)
 }
 
 fn decode_text_bytes(
     raw: &[u8],
-    encoding: &'static Encoding,
+    encoding: TextEncoding,
     font_table: Option<&FontTable>,
 ) -> Result<String> {
     if let Some(tbl) = font_table {
@@ -638,21 +662,76 @@ fn decode_text_bytes(
     }
 }
 
-fn encode_char_ignore(ch: char, encoding: &'static Encoding, out: &mut Vec<u8>) {
-    let ch = if is_shift_jis_encoding(encoding) {
-        python_shift_jis_encode_fixup(ch)
-    } else {
-        ch
-    };
-    let mut tmp = [0u8; 4];
-    let s = ch.encode_utf8(&mut tmp);
-    let (cow, _enc_used, had_errors) = encoding.encode(s);
-    if !had_errors {
-        out.extend_from_slice(&cow);
+fn cp932_encode_map() -> &'static HashMap<char, Vec<u8>> {
+    static MAP: OnceLock<HashMap<char, Vec<u8>>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = HashMap::new();
+
+        for b in 0u16..=0xFF {
+            let raw = [b as u8];
+            if let Ok(s) = decode_cp932_strict(&raw) {
+                if let Some(ch) = single_decoded_char(&s) {
+                    map.entry(ch).or_insert_with(|| raw.to_vec());
+                }
+            }
+        }
+
+        for lead in (0x81u16..=0x9F).chain(0xE0u16..=0xFC) {
+            for trail in 0x40u16..=0xFC {
+                if trail == 0x7F {
+                    continue;
+                }
+                let raw = [lead as u8, trail as u8];
+                if let Ok(s) = decode_cp932_strict(&raw) {
+                    if let Some(ch) = single_decoded_char(&s) {
+                        map.entry(ch).or_insert_with(|| raw.to_vec());
+                    }
+                }
+            }
+        }
+
+        // Python cp932 accepts these historical Unicode aliases on encode even
+        // when cp932 decode returns the Windows/compatibility form.
+        map.insert('\u{301C}', vec![0x81, 0x60]); // WAVE DASH alias
+        map.insert('\u{2016}', vec![0x81, 0x61]); // DOUBLE VERTICAL LINE alias
+        map.insert('\u{2212}', vec![0x81, 0x7C]); // MINUS SIGN alias
+        map.insert('\u{00A2}', vec![0x81, 0x91]); // CENT SIGN alias
+        map.insert('\u{00A3}', vec![0x81, 0x92]); // POUND SIGN alias
+        map.insert('\u{00AC}', vec![0x81, 0xCA]); // NOT SIGN alias
+
+        map
+    })
+}
+
+fn single_decoded_char(s: &str) -> Option<char> {
+    let mut chars = s.chars();
+    let ch = chars.next()?;
+    if chars.next().is_none() { Some(ch) } else { None }
+}
+
+fn encode_char_ignore(ch: char, _encoding: TextEncoding, out: &mut Vec<u8>) {
+    let cp = ch as u32;
+
+    // Keep engine-visible ASCII byte-for-byte. This is critical for literal
+    // control syntax such as \\k, \\n and \\p####.
+    if cp <= 0x7F {
+        out.push(cp as u8);
+        return;
+    }
+
+    // CP932-specific single-byte slots, including the PUA bytes the engine can
+    // use directly: A0/FD/FE/FF.  This fixes the previous skip on U+F8F1 etc.
+    if let Some(b) = cp932_byte_from_single_char(ch) {
+        out.push(b);
+        return;
+    }
+
+    if let Some(raw) = cp932_encode_map().get(&ch) {
+        out.extend_from_slice(raw);
     }
 }
 
-fn encode_lossy_ignore(text: &str, encoding: &'static Encoding) -> Vec<u8> {
+fn encode_lossy_ignore(text: &str, encoding: TextEncoding) -> Vec<u8> {
     let mut out = Vec::new();
     for ch in text.chars() {
         encode_char_ignore(ch, encoding, &mut out);
@@ -705,7 +784,7 @@ fn split_preserving_engine_escapes(text: &str) -> Vec<(bool, String)> {
 
 fn encode_text_bytes(
     text: &str,
-    encoding: &'static Encoding,
+    encoding: TextEncoding,
     font_table: Option<&FontTable>,
 ) -> Vec<u8> {
     if let Some(tbl) = font_table {
@@ -838,7 +917,7 @@ fn compress_lzma_alone(data: &[u8]) -> Vec<u8> {
 
 fn read_text_records_structured(
     data: &[u8],
-    encoding: &'static Encoding,
+    encoding: TextEncoding,
     font_table: Option<&FontTable>,
 ) -> Vec<TextRecordInfo> {
     let mut out = Vec::new();
@@ -1156,7 +1235,7 @@ fn as_inserted_unit(unit: &Value) -> Result<Value> {
 fn hydrate_offsets_from_template(
     orig_data: &[u8],
     units: &[Value],
-    encoding: &'static Encoding,
+    encoding: TextEncoding,
     font_table: Option<&FontTable>,
 ) -> Result<Vec<Value>> {
     let records = read_text_records_structured(orig_data, encoding, font_table);
@@ -1270,7 +1349,7 @@ fn sorted_json_items(units: &[Value]) -> Result<Vec<Value>> {
 
 fn encode_structured_text_item(
     item: &Value,
-    encoding: &'static Encoding,
+    encoding: TextEncoding,
     font_table: Option<&FontTable>,
 ) -> Vec<u8> {
     let text = item
@@ -1311,7 +1390,7 @@ struct RelocEvent {
 fn rebuild_scenario_from_structured_json(
     orig_data: &[u8],
     units: &[Value],
-    encoding: &'static Encoding,
+    encoding: TextEncoding,
     font_table: Option<&FontTable>,
     allow_growth: bool,
     verify_relocations: bool,
@@ -1584,7 +1663,7 @@ fn scan_entries(
 
 fn process_extracted_scripts(
     scanned: &[(ScenarioEntry, Vec<u8>)],
-    encoding: &'static Encoding,
+    encoding: TextEncoding,
     font_table: Option<&FontTable>,
     include_offsets: bool,
     thread: Option<usize>,
@@ -1686,7 +1765,7 @@ fn prepare_rebuild_import(
     task: &RebuildTask,
     eboot_data: &[u8],
     ph_headers: &[ProgramHeader],
-    encoding: &'static Encoding,
+    encoding: TextEncoding,
     font_table: Option<&FontTable>,
     allow_growth: bool,
     verify_relocations: bool,
@@ -1716,7 +1795,7 @@ fn prepare_rebuild_imports(
     tasks: &[RebuildTask],
     eboot_data: &[u8],
     ph_headers: &[ProgramHeader],
-    encoding: &'static Encoding,
+    encoding: TextEncoding,
     font_table: Option<&FontTable>,
     allow_growth: bool,
     verify_relocations: bool,
