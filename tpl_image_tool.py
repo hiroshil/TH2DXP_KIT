@@ -54,6 +54,70 @@ FMT_G8B8 = {0x8B, 0xAB}
 FMT_DXT1 = {0x86, 0xA6}
 
 
+# ---------------------------------------------------------------------------
+# Storage layout helpers
+# ---------------------------------------------------------------------------
+# Some game TPLs (for example extra.tpl and ci.tpl) store ordinary uncompressed
+# texels in a PS3/GCM-style Morton tiled order instead of linear rows.  The
+# record format byte is still the same (0x81 L8, 0x85 ARGB8888, etc.); in the
+# observed files flags bit 0 marks this swizzled storage.  Decode functions
+# expose normal row-major PNGs, and pack functions swizzle PNG pixels back into
+# the original payload layout so template-based rebuild remains byte-stable.
+
+def _is_pow2(v: int) -> bool:
+    return v > 0 and (v & (v - 1)) == 0
+
+
+def is_swizzled_storage(rec: Record) -> bool:
+    return (
+        (rec.flags & 0x01) != 0
+        and rec.fmt not in FMT_DXT1
+        and _is_pow2(rec.width)
+        and _is_pow2(rec.height)
+    )
+
+
+def storage_layout_name(rec: Record) -> str:
+    return "morton_xy_swizzled" if is_swizzled_storage(rec) else "linear"
+
+
+def morton_index_xy(x: int, y: int, width: int, height: int) -> int:
+    """Morton order used by this game's swizzled rectangular pow2 textures.
+
+    Bits are interleaved as x bit, then y bit, skipping dimensions once their
+    bit range is exhausted.  This handles both square and rectangular pow2
+    textures such as 1024x128 and 16x256.
+    """
+    off = 0
+    shift = 0
+    bit = 1
+    while bit < width or bit < height:
+        if bit < width:
+            if x & bit:
+                off |= 1 << shift
+            shift += 1
+        if bit < height:
+            if y & bit:
+                off |= 1 << shift
+            shift += 1
+        bit <<= 1
+    return off
+
+
+def texel_offset_in_file(rec: Record, x: int, y: int, bpp: int) -> int:
+    if is_swizzled_storage(rec):
+        return rec.data_offset + morton_index_xy(x, y, rec.width, rec.height) * bpp
+    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
+    return rec.data_offset + y * row_pitch + x * bpp
+
+
+def texel_offset_in_payload(rec: Record, x: int, y: int, bpp: int) -> int:
+    if is_swizzled_storage(rec):
+        return morton_index_xy(x, y, rec.width, rec.height) * bpp
+    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
+    return y * row_pitch + x * bpp
+
+
 @dataclass
 class Record:
     index: int
@@ -235,12 +299,10 @@ def iter_u16be_row(buf: bytes, rec: Record, y: int) -> Iterable[int]:
 
 
 def decode_a4r4g4b4(buf: bytes, rec: Record) -> Image.Image:
-    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
     out = bytearray(rec.width * rec.height * 4)
     for y in range(rec.height):
-        src_row = rec.data_offset + y * row_pitch
         for x in range(rec.width):
-            o = src_row + x * 2
+            o = texel_offset_in_file(rec, x, y, 2)
             px = (buf[o] << 8) | buf[o + 1]
             a = ((px >> 12) & 0xF) * 17
             r = ((px >> 8) & 0xF) * 17
@@ -250,15 +312,12 @@ def decode_a4r4g4b4(buf: bytes, rec: Record) -> Image.Image:
             out[d:d + 4] = bytes((r, g, b, a))
     return Image.frombytes("RGBA", (rec.width, rec.height), bytes(out))
 
-
 def extract_a4_channels(buf: bytes, rec: Record) -> Dict[str, Image.Image]:
     planes: Dict[str, bytearray] = {ch: bytearray(rec.width * rec.height) for ch in RAW_CHANNELS}
-    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
     for y in range(rec.height):
-        src_row = rec.data_offset + y * row_pitch
         row_i = y * rec.width
         for x in range(rec.width):
-            o = src_row + x * 2
+            o = texel_offset_in_file(rec, x, y, 2)
             px = (buf[o] << 8) | buf[o + 1]
             planes["A"][row_i + x] = ((px >> 12) & 0xF) * 17
             planes["R"][row_i + x] = ((px >> 8) & 0xF) * 17
@@ -266,42 +325,33 @@ def extract_a4_channels(buf: bytes, rec: Record) -> Dict[str, Image.Image]:
             planes["B"][row_i + x] = (px & 0xF) * 17
     return {ch: Image.frombytes("L", (rec.width, rec.height), bytes(data)) for ch, data in planes.items()}
 
-
 def decode_argb8888(buf: bytes, rec: Record) -> Image.Image:
-    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
     out = bytearray(rec.width * rec.height * 4)
     for y in range(rec.height):
-        src = rec.data_offset + y * row_pitch
         for x in range(rec.width):
-            o = src + x * 4
+            o = texel_offset_in_file(rec, x, y, 4)
             a, r, g, b = buf[o], buf[o + 1], buf[o + 2], buf[o + 3]
             d = (y * rec.width + x) * 4
             out[d:d + 4] = bytes((r, g, b, a))
     return Image.frombytes("RGBA", (rec.width, rec.height), bytes(out))
 
-
 def decode_l8(buf: bytes, rec: Record) -> Image.Image:
-    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
     out = bytearray(rec.width * rec.height)
     for y in range(rec.height):
-        src = rec.data_offset + y * row_pitch
-        out[y * rec.width:(y + 1) * rec.width] = buf[src:src + rec.width]
+        for x in range(rec.width):
+            out[y * rec.width + x] = buf[texel_offset_in_file(rec, x, y, 1)]
     return Image.frombytes("L", (rec.width, rec.height), bytes(out))
-
 
 def decode_g8b8(buf: bytes, rec: Record) -> Image.Image:
     # CELL_GCM_TEXTURE_G8B8 family. For editing, expose as LA: first byte=L, second byte=alpha.
-    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
     out = bytearray(rec.width * rec.height * 2)
     for y in range(rec.height):
-        src = rec.data_offset + y * row_pitch
         for x in range(rec.width):
-            o = src + x * 2
+            o = texel_offset_in_file(rec, x, y, 2)
             d = (y * rec.width + x) * 2
             out[d] = buf[o]
             out[d + 1] = buf[o + 1]
     return Image.frombytes("LA", (rec.width, rec.height), bytes(out))
-
 
 def rgb565_to_rgba(c: int) -> Tuple[int, int, int, int]:
     r = ((c >> 11) & 0x1F) * 255 // 31
@@ -368,11 +418,9 @@ def load_luma_4bit(path: Path, size: Tuple[int, int]) -> bytes:
 
 def pack_a4r4g4b4(template_payload: bytes, rec: Record, png_paths: Dict[str, Path]) -> bytes:
     size = (rec.width, rec.height)
-    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
     planes = {ch: load_luma_4bit(png_paths[ch], size) for ch in RAW_CHANNELS}
     out = bytearray(template_payload)
     for y in range(rec.height):
-        dst = y * row_pitch
         src_row = y * rec.width
         for x in range(rec.width):
             a = planes["A"][src_row + x]
@@ -380,41 +428,35 @@ def pack_a4r4g4b4(template_payload: bytes, rec: Record, png_paths: Dict[str, Pat
             g = planes["G"][src_row + x]
             b = planes["B"][src_row + x]
             px = (a << 12) | (r << 8) | (g << 4) | b
-            o = dst + x * 2
+            o = texel_offset_in_payload(rec, x, y, 2)
             out[o] = (px >> 8) & 0xFF
             out[o + 1] = px & 0xFF
     return bytes(out)
-
 
 def pack_argb8888(template_payload: bytes, rec: Record, png_path: Path) -> bytes:
     img = Image.open(png_path).convert("RGBA")
     if img.size != (rec.width, rec.height):
         raise ValueError(f"{png_path.name}: size {img.size} != expected {(rec.width, rec.height)}")
     src = img.tobytes()
-    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
     out = bytearray(template_payload)
     for y in range(rec.height):
-        dst_row = y * row_pitch
-        src_row = y * rec.width * 4
         for x in range(rec.width):
-            s = src_row + x * 4
+            s = (y * rec.width + x) * 4
             r, g, b, a = src[s], src[s + 1], src[s + 2], src[s + 3]
-            d = dst_row + x * 4
+            d = texel_offset_in_payload(rec, x, y, 4)
             out[d:d + 4] = bytes((a, r, g, b))
     return bytes(out)
-
 
 def pack_l8(template_payload: bytes, rec: Record, png_path: Path) -> bytes:
     img = Image.open(png_path).convert("L")
     if img.size != (rec.width, rec.height):
         raise ValueError(f"{png_path.name}: size {img.size} != expected {(rec.width, rec.height)}")
     src = img.tobytes()
-    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
     out = bytearray(template_payload)
     for y in range(rec.height):
-        out[y * row_pitch:y * row_pitch + rec.width] = src[y * rec.width:(y + 1) * rec.width]
+        for x in range(rec.width):
+            out[texel_offset_in_payload(rec, x, y, 1)] = src[y * rec.width + x]
     return bytes(out)
-
 
 def pack_g8b8(template_payload: bytes, rec: Record, png_path: Path) -> bytes:
     img = Image.open(png_path)
@@ -427,14 +469,13 @@ def pack_g8b8(template_payload: bytes, rec: Record, png_path: Path) -> bytes:
         r, g, b, a = rgba.split()
         l = Image.merge("RGB", (r, g, b)).convert("L")
         la = Image.merge("LA", (l, a)).tobytes()
-    row_pitch = row_pitch_for(rec.fmt, rec.width, rec.pitch)
     out = bytearray(template_payload)
     for y in range(rec.height):
-        src_row = y * rec.width * 2
-        dst_row = y * row_pitch
-        out[dst_row:dst_row + rec.width * 2] = la[src_row:src_row + rec.width * 2]
+        for x in range(rec.width):
+            s = (y * rec.width + x) * 2
+            d = texel_offset_in_payload(rec, x, y, 2)
+            out[d:d + 2] = la[s:s + 2]
     return bytes(out)
-
 
 def rgba_to_565(r: int, g: int, b: int) -> int:
     return ((r * 31 + 127) // 255 << 11) | ((g * 63 + 127) // 255 << 5) | ((b * 31 + 127) // 255)
@@ -542,6 +583,7 @@ def extract_tpl(tpl_path: Path, out_dir: Path, name: Optional[str] = None, dump_
         rec_meta = asdict(rec)
         rec_meta.update({
             "format_class": rec.class_name,
+            "storage_layout": storage_layout_name(rec),
             "payload_bin": payload_name if dump_raw else None,
             "png": None,
             "channel_pngs": {},
@@ -654,10 +696,9 @@ def print_info(tpl_path: Path) -> None:
             f"[{rec.index}] raw_dims=(0x{rec.raw0:04X},0x{rec.raw1:04X}) "
             f"layout={rec.layout} resolved={rec.width}x{rec.height} "
             f"pitch=0x{rec.pitch:X} fmt=0x{rec.fmt:02X} flags=0x{rec.flags:02X} "
-            f"class={rec.class_name} data=0x{rec.data_offset:X}..0x{rec.end_offset:X} "
+            f"storage={storage_layout_name(rec)} class={rec.class_name} data=0x{rec.data_offset:X}..0x{rec.end_offset:X} "
             f"span=0x{rec.span_size:X} gap=0x{rec.gap_size:X}"
         )
-
 
 def roundtrip_check(tpl_path: Path, encode_dxt1: bool = False) -> None:
     import tempfile
