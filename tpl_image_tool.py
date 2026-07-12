@@ -12,6 +12,7 @@ this batch:
   0x85 / 0xA5 / 0xBE  A8R8G8B8-like 32bpp payload, stored as bytes A,R,G,B.
   0x81 / 0xA1  8bpp single-channel payload.
   0x8B / 0xAB  G8B8 two-channel payload, exported as PNG LA (L, alpha).
+  0x84 / 0xA4  R5G6B5 / RGB565, big-endian 16-bit pixels.
   0x86 / 0xA6  DXT1 block-compressed payload.
 
 Safe rebuild model:
@@ -51,6 +52,7 @@ FMT_A4R4G4B4 = {0x83, 0xA3}
 FMT_ARGB8888 = {0x85, 0xA5, 0xBE}
 FMT_L8 = {0x81, 0xA1}
 FMT_G8B8 = {0x8B, 0xAB}
+FMT_RGB565 = {0x84, 0xA4}
 FMT_DXT1 = {0x86, 0xA6}
 
 
@@ -160,6 +162,8 @@ def classify_fmt(fmt: int) -> str:
         return "L8_8bpp"
     if fmt in FMT_G8B8:
         return "G8B8_16bpp_LA"
+    if fmt in FMT_RGB565:
+        return "RGB565_16bpp"
     if fmt in FMT_DXT1:
         return "DXT1"
     return f"unknown_0x{fmt:02X}"
@@ -168,7 +172,7 @@ def classify_fmt(fmt: int) -> str:
 def row_pitch_for(fmt: int, width: int, pitch: int) -> int:
     if fmt in FMT_ARGB8888:
         return pitch if pitch else width * 4
-    if fmt in FMT_A4R4G4B4 or fmt in FMT_G8B8:
+    if fmt in FMT_A4R4G4B4 or fmt in FMT_G8B8 or fmt in FMT_RGB565:
         return pitch if pitch else width * 2
     if fmt in FMT_L8:
         return pitch if pitch else width
@@ -192,7 +196,7 @@ def expected_payload_size(fmt: int, width: int, height: int, pitch: int) -> Opti
     if fmt in FMT_ARGB8888:
         if row_pitch < width * 4:
             return None
-    elif fmt in FMT_A4R4G4B4 or fmt in FMT_G8B8:
+    elif fmt in FMT_A4R4G4B4 or fmt in FMT_G8B8 or fmt in FMT_RGB565:
         if row_pitch < width * 2:
             return None
     elif fmt in FMT_L8:
@@ -264,7 +268,7 @@ def parse_records(buf: bytes) -> List[Record]:
                 score += 100
             if fmt in FMT_ARGB8888 and row_pitch == width * 4:
                 score += 100
-            if (fmt in FMT_A4R4G4B4 or fmt in FMT_G8B8) and row_pitch == width * 2:
+            if (fmt in FMT_A4R4G4B4 or fmt in FMT_G8B8 or fmt in FMT_RGB565) and row_pitch == width * 2:
                 score += 100
             if fmt in FMT_L8 and row_pitch == width:
                 score += 100
@@ -390,6 +394,20 @@ def decode_dxt1_payload(payload: bytes, width: int, height: int, pitch: int) -> 
     return img
 
 
+def decode_rgb565(buf: bytes, rec: Record) -> Image.Image:
+    out = bytearray(rec.width * rec.height * 4)
+    for y in range(rec.height):
+        for x in range(rec.width):
+            o = texel_offset_in_file(rec, x, y, 2)
+            px = (buf[o] << 8) | buf[o + 1]
+            r = ((px >> 11) & 0x1F) * 255 // 31
+            g = ((px >> 5) & 0x3F) * 255 // 63
+            b = (px & 0x1F) * 255 // 31
+            d = (y * rec.width + x) * 4
+            out[d:d + 4] = bytes((r, g, b, 255))
+    return Image.frombytes("RGBA", (rec.width, rec.height), bytes(out))
+
+
 def decode_record(buf: bytes, rec: Record) -> Image.Image:
     if rec.fmt in FMT_A4R4G4B4:
         return decode_a4r4g4b4(buf, rec)
@@ -399,6 +417,8 @@ def decode_record(buf: bytes, rec: Record) -> Image.Image:
         return decode_l8(buf, rec)
     if rec.fmt in FMT_G8B8:
         return decode_g8b8(buf, rec)
+    if rec.fmt in FMT_RGB565:
+        return decode_rgb565(buf, rec)
     if rec.fmt in FMT_DXT1:
         return decode_dxt1_payload(record_payload(buf, rec), rec.width, rec.height, rec.pitch)
     raise ValueError(f"record {rec.index}: unsupported format 0x{rec.fmt:02X}")
@@ -476,6 +496,23 @@ def pack_g8b8(template_payload: bytes, rec: Record, png_path: Path) -> bytes:
             d = texel_offset_in_payload(rec, x, y, 2)
             out[d:d + 2] = la[s:s + 2]
     return bytes(out)
+
+def pack_rgb565(template_payload: bytes, rec: Record, png_path: Path) -> bytes:
+    img = Image.open(png_path).convert("RGBA")
+    if img.size != (rec.width, rec.height):
+        raise ValueError(f"{png_path.name}: size {img.size} != expected {(rec.width, rec.height)}")
+    src = img.tobytes()
+    out = bytearray(template_payload)
+    for y in range(rec.height):
+        for x in range(rec.width):
+            s = (y * rec.width + x) * 4
+            r, g, b = src[s], src[s + 1], src[s + 2]
+            px = ((r * 31 + 127) // 255 << 11) | ((g * 63 + 127) // 255 << 5) | ((b * 31 + 127) // 255)
+            d = texel_offset_in_payload(rec, x, y, 2)
+            out[d] = (px >> 8) & 0xFF
+            out[d + 1] = px & 0xFF
+    return bytes(out)
+
 
 def rgba_to_565(r: int, g: int, b: int) -> int:
     return ((r * 31 + 127) // 255 << 11) | ((g * 63 + 127) // 255 << 5) | ((b * 31 + 127) // 255)
@@ -651,6 +688,8 @@ def rebuild_tpl(template_tpl: Path, extracted_dir: Path, out_tpl: Path, meta_pat
             new_payload = pack_l8(old_payload, rec, extracted_dir / m["png"])
         elif rec.fmt in FMT_G8B8:
             new_payload = pack_g8b8(old_payload, rec, extracted_dir / m["png"])
+        elif rec.fmt in FMT_RGB565:
+            new_payload = pack_rgb565(old_payload, rec, extracted_dir / m["png"])
         elif rec.fmt in FMT_DXT1:
             if encode_dxt1:
                 img = Image.open(extracted_dir / m["png"])
