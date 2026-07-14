@@ -21,9 +21,6 @@ Important model:
   * Strict length is default; pass --allow-growth only when intentionally testing
     relocated/grown logical messages.
   * No auto-padding and no auto-wrap are performed.
-  * Default text codec is cp932/Windows-31J because the engine uses CP932/EUDC glyph slots.
-    Private-use characters such as U+E000/U+E001 are valid JSON text and round-trip
-    back to their CP932 bytes when the editor preserves UTF-8.
 """
 
 from __future__ import annotations
@@ -41,7 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 TOOL_NAME = "scenario_eboot_cli"
-TOOL_VERSION = 16
+TOOL_VERSION = 0.19
 DEFAULT_TABLE_START = 0x000EE8B4
 DEFAULT_MAX_ENTRIES = 2000
 DEFAULT_INPLACE_OFFSET_BASE = 0x0029F000
@@ -1156,7 +1153,7 @@ def command_rebuild(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 TOOL_NAME = "scenario_eboot_structured_singlefile_cli"
-TOOL_VERSION = 16
+TOOL_VERSION = 19
 META_FILENAME = META_FILENAME
 TEXT_OPCODE = TEXT_OPCODE
 DEFAULT_ENCODING = DEFAULT_ENCODING
@@ -1245,6 +1242,301 @@ def _hex(data: bytes) -> str:
     return data.hex().upper()
 
 
+# ---------------------------------------------------------------------------
+# Scenario VM opcode-gap decoder
+# ---------------------------------------------------------------------------
+
+_BYTECODE_DECODER_NAME = "scenario_vm_gap_decoder"
+_BYTECODE_DECODER_VERSION = 2
+
+_SINGLE_BYTE_OP_NAMES: Dict[int, str] = {
+    0x00: "zero_or_padding",
+    0x01: "op_01",
+    0x03: "op_03",
+    0x04: "op_04",
+    0x06: "op_06",
+    0x17: "op_17",
+    0x18: "op_18",
+    0x19: "op_19",
+    0x1A: "op_1A",
+    0x22: "op_22",
+    0x2A: "op_2A",
+}
+
+_CMD8_HINTS: Dict[int, str] = {
+    # Names are intentionally conservative.  The bytecode handler table is not
+    # symbolized in the stripped EBOOT, so these are corpus-facing labels rather
+    # than hard semantic claims.
+    0x19: "vm_cmd_19",
+    0x20: "message/page-flow marker",
+    0x27: "vm_cmd_27",
+    0x30: "vm_cmd_30",
+    0x46: "vm_cmd_46",
+    0x47: "vm_cmd_47",
+    0x49: "vm_cmd_49",
+    0x4D: "vm_cmd_4D",
+    0x4E: "vm_cmd_4E",
+    0x51: "vm_cmd_51",
+    0x52: "vm_cmd_52",
+    0x6A: "asset/layer command family",
+    0x6B: "asset/layer command family",
+}
+
+
+def _json_hex(raw: bytes) -> str:
+    return raw.hex().upper()
+
+
+def _is_printable_ascii_bytes(raw: bytes) -> bool:
+    return all(0x20 <= b <= 0x7E for b in raw)
+
+
+def _decode_bytecode_string(raw: bytes, encoding: str, font_table: Optional[FontTable]) -> str:
+    if not raw:
+        return ""
+    try:
+        if font_table is not None:
+            return font_table.decode_bytes(raw, encoding)
+        # ASCII asset names and labels are common inside opcode gaps; try ASCII
+        # first so binary-ish text fallback does not hide malformed data.
+        if _is_printable_ascii_bytes(raw):
+            return raw.decode("ascii")
+        return raw.decode(encoding)
+    except Exception:
+        try:
+            return raw.decode(encoding, errors="replace")
+        except Exception:
+            return raw.decode("latin-1", errors="replace")
+
+
+def _literal_values(raw: bytes) -> Dict[str, Any]:
+    values: Dict[str, Any] = {"hex": _json_hex(raw), "length": len(raw)}
+    if len(raw) == 1:
+        values["u8"] = raw[0]
+        values["i8"] = struct.unpack("<b", raw)[0]
+    elif len(raw) == 2:
+        values["u16le"] = struct.unpack("<H", raw)[0]
+        values["i16le"] = struct.unpack("<h", raw)[0]
+    elif len(raw) == 4:
+        values["u32le"] = struct.unpack("<I", raw)[0]
+        values["i32le"] = struct.unpack("<i", raw)[0]
+        values["f32le"] = struct.unpack("<f", raw)[0]
+    elif len(raw) == 8:
+        values["u64le"] = struct.unpack("<Q", raw)[0]
+        values["i64le"] = struct.unpack("<q", raw)[0]
+        values["f64le"] = struct.unpack("<d", raw)[0]
+    return values
+
+
+def decode_scenario_opcode_gap(
+    raw: bytes,
+    *,
+    base_offset: Optional[int] = None,
+    encoding: str = DEFAULT_ENCODING,
+    font_table: Optional[FontTable] = None,
+) -> Dict[str, Any]:
+    """Decode a structured ``opcode_gap`` into scenario-VM tokens.
+
+    Important distinction: these bytes are not PowerPC instructions.  They are
+    scenario VM bytecode embedded between TEXT records.  Capstone is useful for
+    auditing the stripped EBOOT handler, but gap bytes must be decoded with this
+    VM grammar:
+      02                         statement/end marker
+      08 xx                      command family / command id
+      09 len payload             typed numeric literal, commonly len=4 f32le
+      0A len16 payload           string literal, commonly ASCII asset names
+      05 len payload             label/name operand, often @label
+      07 cstring\0               zero-terminated short symbol
+      02 0B 00 0A len16 payload  embedded text record, even if text decoding fails
+
+    The decoder is deliberately lossless: every emitted token includes the raw
+    bytes.  Rebuild still uses the original ``bytes`` field; decoded output is
+    for editing diagnostics and reverse-engineering only.
+    """
+    tokens: List[Dict[str, Any]] = []
+    asm_lines: List[str] = []
+    pseudo_lines: List[str] = []
+    warnings: List[str] = []
+    i = 0
+
+    def token_offset(pos: int) -> str:
+        if base_offset is None:
+            return f"+0x{pos:X}"
+        return f"0x{base_offset + pos:X}"
+
+    def add_token(kind: str, start: int, end: int, asm: str, pseudo: str, **extra: Any) -> None:
+        item: Dict[str, Any] = {
+            "offset": token_offset(start),
+            "rel_offset": f"+0x{start:X}",
+            "kind": kind,
+            "length": end - start,
+            "raw": _json_hex(raw[start:end]),
+            "asm": asm,
+            "pseudo_c": pseudo,
+        }
+        item.update(extra)
+        tokens.append(item)
+        asm_lines.append(f"{token_offset(start)}: {asm}")
+        pseudo_lines.append(pseudo)
+
+    while i < len(raw):
+        start = i
+
+        # Existing extractor uses TEXT_OPCODE = 02 0B 00 0A.  A few corpus gaps
+        # contain such records with non-standard glyph bytes that fail Shift-JIS
+        # decoding, so make the bytecode decoder identify them explicitly instead
+        # of letting them appear as raw unknown bytes.
+        if raw[i:i + 4] == TEXT_OPCODE and i + 6 <= len(raw):
+            length = struct.unpack_from("<H", raw, i + 4)[0]
+            end = i + 6 + length
+            if end <= len(raw):
+                payload = raw[i + 6:end]
+                text = _decode_bytecode_string(payload, encoding, font_table)
+                add_token(
+                    "text_record",
+                    start,
+                    end,
+                    f"text len=0x{length:X} {text!r}",
+                    f"emit_text({text!r});",
+                    text=text,
+                    payload_hex=_json_hex(payload),
+                )
+                i = end
+                continue
+            warnings.append(f"{token_offset(start)}: truncated TEXT record length 0x{length:X}")
+
+        b = raw[i]
+
+        if b == 0x02:
+            add_token("statement_end", start, start + 1, "end", "vm_end_statement();")
+            i += 1
+            continue
+
+        if b == 0x08 and i + 1 < len(raw):
+            cmd = raw[i + 1]
+            hint = _CMD8_HINTS.get(cmd)
+            suffix = f" ; {hint}" if hint else ""
+            add_token(
+                "command_08",
+                start,
+                start + 2,
+                f"cmd8 0x{cmd:02X}{suffix}",
+                f"vm_cmd8(0x{cmd:02X});",
+                command_id=f"0x{cmd:02X}",
+                hint=hint,
+            )
+            i += 2
+            continue
+
+        if b == 0x09 and i + 1 < len(raw):
+            n = raw[i + 1]
+            end = i + 2 + n
+            if n in {1, 2, 4, 8, 16} and end <= len(raw):
+                payload = raw[i + 2:end]
+                values = _literal_values(payload)
+                if n == 4:
+                    asm = f"literal len=4 f32={values['f32le']:.8g} i32={values['i32le']}"
+                    pseudo = f"vm_push_literal_f32({values['f32le']:.8g});"
+                else:
+                    asm = f"literal len={n} 0x{_json_hex(payload)}"
+                    pseudo = f"vm_push_literal_bytes({values['hex']!r});"
+                add_token(
+                    "literal_09",
+                    start,
+                    end,
+                    asm,
+                    pseudo,
+                    values=values,
+                )
+                i = end
+                continue
+            if n in {1, 2, 4, 8, 16}:
+                warnings.append(f"{token_offset(start)}: truncated literal_09 length {n}")
+
+        if b == 0x0A and i + 2 < len(raw):
+            n = struct.unpack_from("<H", raw, i + 1)[0]
+            end = i + 3 + n
+            if n <= 0x400 and end <= len(raw):
+                payload = raw[i + 3:end]
+                text = _decode_bytecode_string(payload, encoding, font_table)
+                add_token(
+                    "string_0A",
+                    start,
+                    end,
+                    f"string len=0x{n:X} {text!r}",
+                    f"vm_push_string({text!r});",
+                    text=text,
+                    payload_hex=_json_hex(payload),
+                )
+                i = end
+                continue
+            if n <= 0x400:
+                warnings.append(f"{token_offset(start)}: truncated string_0A length {n}")
+
+        if b == 0x05 and i + 1 < len(raw):
+            n = raw[i + 1]
+            end = i + 2 + n
+            if n <= 0x40 and end <= len(raw):
+                payload = raw[i + 2:end]
+                text = _decode_bytecode_string(payload, encoding, font_table)
+                add_token(
+                    "label_ref_05",
+                    start,
+                    end,
+                    f"label len=0x{n:X} {text!r}",
+                    f"vm_label_ref({text!r});",
+                    text=text,
+                    payload_hex=_json_hex(payload),
+                )
+                i = end
+                continue
+            if n <= 0x40:
+                warnings.append(f"{token_offset(start)}: truncated label_ref_05 length {n}")
+
+        if b == 0x07:
+            nul = raw.find(b"\0", i + 1)
+            if nul >= 0:
+                payload = raw[i + 1:nul]
+                # Limit accidental runaway cstrings; genuine label-like operands
+                # in this corpus are short printable ASCII identifiers.
+                if len(payload) <= 0x40 and (not payload or _is_printable_ascii_bytes(payload)):
+                    text = _decode_bytecode_string(payload, encoding, font_table)
+                    add_token(
+                        "cstring_07",
+                        start,
+                        nul + 1,
+                        f"cstring7 {text!r}",
+                        f"vm_cstring7({text!r});",
+                        text=text,
+                        payload_hex=_json_hex(payload),
+                    )
+                    i = nul + 1
+                    continue
+
+        name = _SINGLE_BYTE_OP_NAMES.get(b, f"op_{b:02X}")
+        add_token(
+            "single_byte_op",
+            start,
+            start + 1,
+            name,
+            f"vm_op(0x{b:02X});",
+            opcode=f"0x{b:02X}",
+            name=name,
+        )
+        i += 1
+
+    return {
+        "decoder": _BYTECODE_DECODER_NAME,
+        "version": _BYTECODE_DECODER_VERSION,
+        "byte_length": len(raw),
+        "token_count": len(tokens),
+        "asm": asm_lines,
+        "pseudo_c": pseudo_lines,
+        "tokens": tokens,
+        "warnings": warnings,
+    }
+
+
 def _with_offset(item: Dict[str, Any], offset: str, include_offsets: bool) -> Dict[str, Any]:
     if include_offsets:
         item["offset"] = offset
@@ -1256,6 +1548,9 @@ def make_structured_units(
     records: List[TextRecordInfo],
     *,
     include_offsets: bool = False,
+    encoding: str = DEFAULT_ENCODING,
+    font_table: Optional[FontTable] = None,
+    decode_gaps: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Build editable units from the script bytecode.
@@ -1328,12 +1623,20 @@ def make_structured_units(
         gap = data[rec.end_int:next_off]
         has_gap = bool(gap)
         if has_gap:
-            cur_items.append(_with_offset({
+            gap_item: Dict[str, Any] = {
                 "kind": "opcode_gap",
                 "length": len(gap),
                 "bytes": _hex(gap),
                 "editable": False,
-            }, f"0x{rec.end_int:X}", include_offsets))
+            }
+            if decode_gaps:
+                gap_item["decoded"] = decode_scenario_opcode_gap(
+                    gap,
+                    base_offset=rec.end_int,
+                    encoding=encoding,
+                    font_table=font_table,
+                )
+            cur_items.append(_with_offset(gap_item, f"0x{rec.end_int:X}", include_offsets))
 
         terminal = kind == "control_text" or control_kind != "none"
         if terminal:
@@ -1475,7 +1778,10 @@ def _hydrate_offsets_from_template(
     To add an item inside an existing unit, add ``"insert": true`` to that item.
     """
     records = read_text_records_structured(orig_data, encoding, font_table)
-    template_units = make_structured_units(orig_data, records, include_offsets=True)
+    template_units = make_structured_units(
+        orig_data, records, include_offsets=True,
+        encoding=encoding, font_table=font_table, decode_gaps=False,
+    )
     hydrated: List[Dict[str, Any]] = []
 
     tmpl_unit_pos = 0
@@ -1728,7 +2034,8 @@ def build_meta(eboot_path: Path, eboot_data: bytes, entries: List[ScenarioEntry]
         "hash_algorithm": "sha256" if use_hash else None,
         "font_tbl": font_table.meta() if font_table is not None else None,
         "notes": [
-            "v14 extracts structured item lists; offsets are hidden by default and recalculated during rebuild.",
+            "v19 extracts structured item lists; offsets are hidden by default and opcode_gap is raw-only by default.",
+            "opcode_gap.bytes is the default/rebuild source of truth; pass --decode-gaps to add lossless VM-token asm/pseudo-C diagnostics.",
             "Edit only text.translated_text by default.",
             "control_text and opcode_gap are preserved as explicit non-editable bytecode items.",
             "Offsets are omitted by default; rebuild aligns existing items by unit/item order. Use extract --debug-offsets for diagnostics.",
@@ -1759,7 +2066,10 @@ def command_extract(args: argparse.Namespace) -> None:
     total_records = 0
     for entry, dec in scanned:
         records = read_text_records_structured(dec, args.encoding, font_table)
-        units = make_structured_units(dec, records, include_offsets=args.debug_offsets)
+        units = make_structured_units(
+            dec, records, include_offsets=args.debug_offsets,
+            encoding=args.encoding, font_table=font_table, decode_gaps=args.decode_gaps,
+        )
         entry.text_count = len(units)
         total_units += len(units)
         total_items += sum(len(u.get("items", [])) for u in units)
@@ -1862,6 +2172,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-entries", type=int, default=DEFAULT_MAX_ENTRIES)
     p.add_argument("--encoding", default=DEFAULT_ENCODING)
     p.add_argument("--debug-offsets", action="store_true", help="include original byte offsets in extracted JSON for diagnostics")
+    p.add_argument("--decode-gaps", action="store_true", help="add decoded asm/pseudo-C/tokens diagnostics to opcode_gap items; default is raw-only")
+    p.add_argument("--raw-gaps-only", dest="raw_gaps_only", action="store_true", help="accepted for compatibility; raw-only is already the default")
     p.set_defaults(func=command_extract)
 
     p = sub.add_parser("rebuild")
