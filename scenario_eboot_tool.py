@@ -1142,23 +1142,6 @@ def command_rebuild(args: argparse.Namespace) -> None:
     print(f"Reserved area used: {used} bytes")
 
 
-
-# ---------------------------------------------------------------------------
-# Logical-message mode, inlined from v10.  No external scenario_eboot_tool import.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# v14 structured scenario editor
-# ---------------------------------------------------------------------------
-
-TOOL_NAME = "scenario_eboot_structured_singlefile_cli"
-TOOL_VERSION = 19
-META_FILENAME = META_FILENAME
-TEXT_OPCODE = TEXT_OPCODE
-DEFAULT_ENCODING = DEFAULT_ENCODING
-
-
 @dataclass
 class TextRecordInfo:
     offset_int: int
